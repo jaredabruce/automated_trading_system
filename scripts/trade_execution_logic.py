@@ -31,7 +31,7 @@ exchange = Exchange(
 )
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(),
@@ -62,12 +62,9 @@ def get_unexecuted_signals(db_path: str):
             'price': float(row[5]),
             'leverage': int(row[6]) if row[6] else 1
         })
-
-    logging.debug(f"Fetched unexecuted signals: {results}")
     return results
 
 def mark_signal_executed(db_path: str, signal_id: int):
-    logging.debug(f"Marking signal {signal_id} as executed.")
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
@@ -79,16 +76,6 @@ def mark_signal_executed(db_path: str, signal_id: int):
     conn.close()
     logging.info(f"Marked signal {signal_id} as executed.")
 
-def get_position_size():
-    user_state = info.user_state(ACCOUNT_ADDRESS)
-    positions = user_state.get("assetPositions", [])
-    logging.debug(f"User state positions: {positions}")
-    for pos in positions:
-        p = pos["position"]
-        if p["coin"] == "BTC":
-            return float(p["szi"])
-    return 0.0
-
 def get_size_decimals():
     meta_data = info.meta()
     btc_info = next((x for x in meta_data["universe"] if x["name"] == "BTC"), None)
@@ -97,19 +84,15 @@ def get_size_decimals():
     return btc_info["szDecimals"]
 
 def set_leverage(leverage: int):
-    logging.debug(f"Setting leverage: {leverage}")
     resp = exchange.update_leverage(leverage, "BTC", is_cross=True)
     if resp.get("status") == "err":
         logging.error(f"Failed to set leverage to {leverage}: {resp}")
     else:
         logging.info(f"Set leverage to {leverage}x successfully.")
 
-def place_limit_order(side: str, size: float, price: float, reduce_only: bool = False):
-    logging.debug(f"Placing limit order: side={side}, size={size}, price={price}, reduce_only={reduce_only}")
-
+def place_limit_order(side: str, size: float, price: float, reduce_only=False):
     is_buy = (side == "long")
     order_type = {"limit": {"tif": "Gtc"}}
-
     order_resp = exchange.order(
         name="BTC",
         is_buy=is_buy,
@@ -118,37 +101,29 @@ def place_limit_order(side: str, size: float, price: float, reduce_only: bool = 
         order_type=order_type,
         reduce_only=reduce_only
     )
-
     logging.info(f"Placed limit order: side={side}, size={size}, price={price}, reduce_only={reduce_only}")
     logging.info(f"Order Response: {order_resp}")
-
-    if order_resp.get("status") == "ok":
-        return order_resp
-    else:
-        logging.error(f"Limit order failed: {order_resp}")
-        return order_resp
+    return order_resp
 
 def execute_pending_signals(db_path: str):
     sz_decimals = get_size_decimals()
     signals = get_unexecuted_signals(db_path)
-
-    if not signals:
-        logging.debug("No signals to execute.")
 
     for sig in signals:
         action = sig["action"]
         side = sig["side"]
         leverage = sig["leverage"]
 
-        logging.debug(f"Executing signal: {sig}")
-
         if action == "open":
+            # 1. Set leverage
             set_leverage(leverage)
 
+            # 2. Get user state & withdrawable
             user_state = info.user_state(ACCOUNT_ADDRESS)
             withdrawable_str = user_state.get("withdrawable", "0")
             withdrawable = float(withdrawable_str)
 
+            # 3. Get BTC mid price
             all_mids = info.all_mids()
             btc_mid_str = all_mids.get("BTC")
             if not btc_mid_str:
@@ -157,43 +132,48 @@ def execute_pending_signals(db_path: str):
                 continue
             btc_mid = float(btc_mid_str)
 
+            # 4. Calculate trade size = (withdrawable * leverage) / btc_mid
             trade_size = (withdrawable * leverage) / btc_mid
+
+            # Add a small buffer to avoid "insufficient margin" from rounding
+            BUFFER_FACTOR = 0.99  # 1% buffer
+            trade_size *= BUFFER_FACTOR  
+
+            # Round to allowed decimals
             trade_size = round(trade_size, sz_decimals)
-            logging.debug(
-                f"Trade size calculated: {trade_size} BTC using withdrawable={withdrawable}, "
-                f"leverage={leverage}, btc_mid={btc_mid}"
-            )
 
             if trade_size <= 0:
-                logging.error("Trade size is zero or negative. Skipping signal.")
+                logging.error("Trade size is zero or negative after buffer. Skipping signal.")
                 mark_signal_executed(db_path, sig['id'])
                 continue
 
-            # Round price to integer to avoid tick-size issues
+            # Round price to an integer
             rounded_price = int(round(btc_mid))
 
-            resp = place_limit_order(side=side, size=trade_size, price=rounded_price, reduce_only=False)
-            if resp.get("status") == "ok":
-                mark_signal_executed(db_path, sig['id'])
-            else:
-                logging.error("Limit order placement failed; not marking signal as executed.")
+            place_limit_order(side, trade_size, rounded_price, reduce_only=False)
+            mark_signal_executed(db_path, sig['id'])
 
         elif action == "close":
-            position_size = get_position_size()
+            # 1. Check if there's a position to close
+            user_state = info.user_state(ACCOUNT_ADDRESS)
+            positions = user_state.get("assetPositions", [])
+            position_size = 0.0
+            for pos in positions:
+                p = pos["position"]
+                if p["coin"] == "BTC":
+                    position_size = float(p["szi"])
+                    break
+
             if position_size == 0:
                 logging.info("No position found to close. Marking as executed.")
                 mark_signal_executed(db_path, sig['id'])
                 continue
 
+            # 2. Round position size
             close_size = abs(position_size)
             close_size = round(close_size, sz_decimals)
-            opposite_side = "short" if side == "long" else "long"
 
-            logging.debug(
-                f"Closing position: current size={position_size}, "
-                f"close_size={close_size}, opposite_side={opposite_side}"
-            )
-
+            # 3. Round BTC price
             all_mids = info.all_mids()
             btc_mid_str = all_mids.get("BTC")
             if not btc_mid_str:
@@ -201,11 +181,10 @@ def execute_pending_signals(db_path: str):
                 mark_signal_executed(db_path, sig['id'])
                 continue
             btc_mid = float(btc_mid_str)
-
             rounded_price = int(round(btc_mid))
 
-            resp = place_limit_order(side=opposite_side, size=close_size, price=rounded_price, reduce_only=True)
-            if resp.get("status") == "ok":
-                mark_signal_executed(db_path, sig['id'])
-            else:
-                logging.error("Close limit order placement failed; not marking signal as executed.")
+            # 4. Opposite side to close
+            opposite_side = "short" if side == "long" else "long"
+
+            place_limit_order(opposite_side, close_size, rounded_price, reduce_only=True)
+            mark_signal_executed(db_path, sig['id'])
