@@ -168,7 +168,7 @@ def execute_pending_signals(db_path: str, script_start_time: datetime):
             btc_mid = float(btc_mid_str)
 
             # 3. Calculate trade size with a small buffer
-            BUFFER_FACTOR = 0.99
+            BUFFER_FACTOR = 0.98
             sz_decimals = get_size_decimals()
 
             trade_size = (withdrawable * leverage) / btc_mid
