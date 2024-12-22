@@ -27,6 +27,9 @@ logging.basicConfig(
     ]
 )
 
+# Record the script startup time so we skip old signals
+SCRIPT_START_TIME = datetime.now()
+
 def calculate_ibs(close: float, low: float, high: float) -> float:
     if high == low:
         return 0.5
@@ -92,20 +95,6 @@ def initialize_database(db_path: str):
     conn.commit()
     conn.close()
     logging.info(f"Initialized SQLite database at {db_path}.")
-
-def purge_unexecuted_signals(db_path: str):
-    """
-    Remove any unexecuted signals. Called on startup so that any leftover signals
-    from a previous downtime won't execute unexpectedly.
-    """
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM trade_signals WHERE executed = 0')
-    deleted_rows = cursor.rowcount
-    conn.commit()
-    conn.close()
-    if deleted_rows > 0:
-        logging.warning(f"Purged {deleted_rows} unexecuted trade signals on startup.")
 
 def get_latest_hourly_candle(db_path: str, last_processed_id: Optional[int]) -> Optional[dict]:
     conn = sqlite3.connect(db_path)
@@ -197,6 +186,7 @@ class TradingLogic:
             ibs = calculate_ibs(close_price, low_price, high_price)
 
             if not self.trade_active:
+                # Skip if there's already an active open signal
                 if has_active_trade(SQLITE_DB_PATH):
                     return
                 # IBS < 0.2 triggers a new trade
@@ -215,7 +205,8 @@ class TradingLogic:
                     )
                     insert_trade_signal(SQLITE_DB_PATH, trade_signal)
                     logging.info(f"Opened trade: {trade_signal}")
-                    execute_pending_signals(SQLITE_DB_PATH)
+                    # Execute signals created *after* script startup
+                    execute_pending_signals(SQLITE_DB_PATH, script_start_time=SCRIPT_START_TIME)
                     self.trade_active = True
             else:
                 # Close exactly after 1 hour
@@ -232,7 +223,8 @@ class TradingLogic:
                     insert_trade_signal(SQLITE_DB_PATH, trade_close_signal)
                     mark_open_trade_executed(SQLITE_DB_PATH, SYMBOL)
                     logging.info(f"Closed trade: {trade_close_signal}")
-                    execute_pending_signals(SQLITE_DB_PATH)
+                    # Execute only signals created *after* script startup
+                    execute_pending_signals(SQLITE_DB_PATH, script_start_time=SCRIPT_START_TIME)
                     self.trade_active = False
                     self.entry_price = 0.0
                     self.leverage = 1.0
@@ -250,8 +242,15 @@ async def decision_making_loop(trading_logic: TradingLogic):
 
 if __name__ == "__main__":
     try:
+        # Initialize
         initialize_database(SQLITE_DB_PATH)
-        purge_unexecuted_signals(SQLITE_DB_PATH)  # <-- Purge leftover signals on startup
+
+        # We do NOT purge or re-execute old signals on script start
+        # so that no existing signals from before are executed.
+        # (If you do want to clear them, you can call a purge function.)
+
+        SCRIPT_START_TIME = datetime.now()
+
         trading_logic = TradingLogic()
         asyncio.run(decision_making_loop(trading_logic))
     except KeyboardInterrupt:
