@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
+# Import the function to execute signals
 from trade_execution_logic import execute_pending_signals
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../config/.env'))
@@ -26,9 +27,6 @@ logging.basicConfig(
         logging.FileHandler("../logs/decision_making.log", mode='a')
     ]
 )
-
-# Record the script startup time so we skip old signals
-SCRIPT_START_TIME = datetime.now()
 
 def calculate_ibs(close: float, low: float, high: float) -> float:
     if high == low:
@@ -68,6 +66,7 @@ def has_active_trade(db_path: str) -> bool:
 def initialize_database(db_path: str):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trade_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,8 +96,12 @@ def initialize_database(db_path: str):
     logging.info(f"Initialized SQLite database at {db_path}.")
 
 def get_latest_hourly_candle(db_path: str, last_processed_id: Optional[int]) -> Optional[dict]:
+    """
+    Fetch the next unprocessed candle from hourly_candles.
+    """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+
     if last_processed_id:
         cursor.execute('''
             SELECT id, timestamp, open, high, low, close, volume
@@ -114,6 +117,7 @@ def get_latest_hourly_candle(db_path: str, last_processed_id: Optional[int]) -> 
             ORDER BY id ASC
             LIMIT 1
         ''')
+
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -183,18 +187,25 @@ class TradingLogic:
                 logging.warning(f"Invalid candle data: high ({high_price}) < low ({low_price}).")
                 return
 
+            # Calculate IBS & log
             ibs = calculate_ibs(close_price, low_price, high_price)
+            logging.info(f"Candle at {timestamp_str} => IBS={ibs:.4f}")
 
+            # If we currently have no open trade
             if not self.trade_active:
-                # Skip if there's already an active open signal
+                logging.info(f"Using database at {SQLITE_DB_PATH}")
+
+                # If there's already an active open trade, skip
                 if has_active_trade(SQLITE_DB_PATH):
+                    logging.info("Active trade found in DB, skipping new open.")
                     return
-                # IBS < 0.2 triggers a new trade
+
                 if ibs < 0.2:
                     self.leverage = determine_leverage(ibs)
                     self.entry_price = close_price
                     self.entry_time = timestamp
                     side = "long"
+
                     trade_signal = format_trade_signal(
                         action="open",
                         timestamp=timestamp_str,
@@ -205,11 +216,13 @@ class TradingLogic:
                     )
                     insert_trade_signal(SQLITE_DB_PATH, trade_signal)
                     logging.info(f"Opened trade: {trade_signal}")
-                    # Execute signals created *after* script startup
-                    execute_pending_signals(SQLITE_DB_PATH, script_start_time=SCRIPT_START_TIME)
+
+                    # Immediately attempt to execute the new signal
+                    execute_pending_signals(SQLITE_DB_PATH)
                     self.trade_active = True
+
             else:
-                # Close exactly after 1 hour
+                # If we've had a trade open for >= 1 hr, close
                 time_elapsed = timestamp - self.entry_time
                 if time_elapsed >= timedelta(hours=1):
                     side = "long"
@@ -223,12 +236,13 @@ class TradingLogic:
                     insert_trade_signal(SQLITE_DB_PATH, trade_close_signal)
                     mark_open_trade_executed(SQLITE_DB_PATH, SYMBOL)
                     logging.info(f"Closed trade: {trade_close_signal}")
-                    # Execute only signals created *after* script startup
-                    execute_pending_signals(SQLITE_DB_PATH, script_start_time=SCRIPT_START_TIME)
+
+                    execute_pending_signals(SQLITE_DB_PATH)
                     self.trade_active = False
                     self.entry_price = 0.0
                     self.leverage = 1.0
                     self.entry_time = None
+
         except Exception as e:
             logging.error(f"Error processing candle: {e}")
 
@@ -242,15 +256,7 @@ async def decision_making_loop(trading_logic: TradingLogic):
 
 if __name__ == "__main__":
     try:
-        # Initialize
         initialize_database(SQLITE_DB_PATH)
-
-        # We do NOT purge or re-execute old signals on script start
-        # so that no existing signals from before are executed.
-        # (If you do want to clear them, you can call a purge function.)
-
-        SCRIPT_START_TIME = datetime.now()
-
         trading_logic = TradingLogic()
         asyncio.run(decision_making_loop(trading_logic))
     except KeyboardInterrupt:
