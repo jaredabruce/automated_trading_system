@@ -18,7 +18,7 @@ API_SECRET = os.getenv("HYPERLIQUID_API_SECRET")
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "../database/trading.db")
 
 if not ACCOUNT_ADDRESS or not API_SECRET or not API_WALLET_ADDRESS:
-    raise ValueError("Missing ACCOUNT_ADDRESS, HYPERLIQUID_API_KEY, or HYPERLIQUID_API_SECRET in .env")
+    raise ValueError("Missing ACCOUNT_ADDRESS, HYPERLIQUID_API_KEY, or HYPERLIQUID_API_SECRET")
 
 api_wallet = Account.from_key(API_SECRET)
 if api_wallet.address.lower() != API_WALLET_ADDRESS.lower():
@@ -40,26 +40,24 @@ logging.basicConfig(
     ]
 )
 
-def get_unexecuted_signals(db_path: str, script_start_time: datetime):
+def get_unexecuted_signals(db_path: str):
     """
-    Fetch signals that:
-    1) Are unexecuted (executed=0)
-    2) Have created_at >= script_start_time (so we skip old signals)
+    Fetch signals that are unexecuted (executed=0).
+    (No start-time filtering)
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, timestamp, action, symbol, side, price, leverage, created_at
+        SELECT id, timestamp, action, symbol, side, price, leverage
         FROM trade_signals
         WHERE executed = 0
-        AND created_at >= ?
         ORDER BY id ASC
-    ''', (script_start_time.isoformat(),))
-    signals = cursor.fetchall()
+    ''')
+    rows = cursor.fetchall()
     conn.close()
 
     results = []
-    for row in signals:
+    for row in rows:
         results.append({
             'id': row[0],
             'timestamp': row[1],
@@ -67,15 +65,11 @@ def get_unexecuted_signals(db_path: str, script_start_time: datetime):
             'symbol': row[3],
             'side': row[4],
             'price': float(row[5]),
-            'leverage': int(row[6]) if row[6] else 1,
-            'created_at': row[7]
+            'leverage': int(row[6]) if row[6] else 1
         })
     return results
 
 def mark_signal_executed(db_path: str, signal_id: int):
-    """
-    Mark a signal as successfully executed (executed=1).
-    """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
@@ -85,13 +79,9 @@ def mark_signal_executed(db_path: str, signal_id: int):
     ''', (signal_id,))
     conn.commit()
     conn.close()
-    logging.info(f"Marked signal {signal_id} as executed (success).")
+    logging.info(f"Marked signal {signal_id} as executed.")
 
 def mark_signal_failed(db_path: str, signal_id: int):
-    """
-    Mark a signal as failed execution (executed=2).
-    This ensures we won't keep retrying it.
-    """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute('''
@@ -132,29 +122,30 @@ def place_limit_order(side: str, size: float, price: float, reduce_only=False):
     logging.info(f"Order Response: {order_resp}")
     return order_resp
 
-def execute_pending_signals(db_path: str, script_start_time: datetime):
+def execute_pending_signals(db_path: str):
     """
-    Process unexecuted signals created after script_start_time.
-    If an order fails, mark the signal as 'failed' instead of marking it executed.
+    Process all unexecuted signals, no time filter. 
+    If order fails, mark as failed. Otherwise, mark executed.
     """
     sz_decimals = get_size_decimals()
-    signals = get_unexecuted_signals(db_path, script_start_time)
+    signals = get_unexecuted_signals(db_path)
     if not signals:
-        logging.info("No new unexecuted signals found to execute.")
+        logging.info("No unexecuted trade signals found.")
         return
 
     for sig in signals:
-        logging.info(f"Executing signal {sig['id']} with data: {sig}")
+        signal_id = sig["id"]
         action = sig["action"]
         side = sig["side"]
         leverage = sig["leverage"]
-        signal_id = sig["id"]
+        price = sig["price"]  # not currently used but included
+
+        logging.info(f"Executing signal {signal_id} => {sig}")
 
         if action == "open":
-            # 1. Set leverage
+            # Attempt to set leverage
             set_leverage(leverage)
 
-            # 2. Check margin
             user_state = info.user_state(ACCOUNT_ADDRESS)
             withdrawable_str = user_state.get("withdrawable", "0")
             withdrawable = float(withdrawable_str)
@@ -162,15 +153,13 @@ def execute_pending_signals(db_path: str, script_start_time: datetime):
             all_mids = info.all_mids()
             btc_mid_str = all_mids.get("BTC")
             if not btc_mid_str:
-                logging.error("BTC mid price not found; cannot place limit order.")
+                logging.error("BTC mid price not found, marking failed.")
                 mark_signal_failed(db_path, signal_id)
                 continue
             btc_mid = float(btc_mid_str)
 
-            # 3. Calculate trade size with a small buffer
+            # small buffer to avoid margin issues
             BUFFER_FACTOR = 0.98
-            sz_decimals = get_size_decimals()
-
             trade_size = (withdrawable * leverage) / btc_mid
             trade_size *= BUFFER_FACTOR
             trade_size = round(trade_size, sz_decimals)
@@ -180,27 +169,18 @@ def execute_pending_signals(db_path: str, script_start_time: datetime):
                 mark_signal_failed(db_path, signal_id)
                 continue
 
-            # 4. Limit price => integer
             rounded_price = int(round(btc_mid))
-
             resp = place_limit_order(side, trade_size, rounded_price, reduce_only=False)
-            # If the API returned error, mark failed
             if resp.get("status") == "err":
-                logging.error(f"Order failed for signal {signal_id}. Marking as failed.")
                 mark_signal_failed(db_path, signal_id)
             else:
-                # Even if there's partial fill or something, we consider the signal "executed."
-                # The actual order stays on the books as GTC.
-                # If you want to check if "error" is in resp, do so here.
                 statuses = resp["response"]["data"].get("statuses", [])
                 if any("error" in s for s in statuses):
-                    logging.error(f"Exchange returned error for signal {signal_id}. Marking as failed.")
                     mark_signal_failed(db_path, signal_id)
                 else:
                     mark_signal_executed(db_path, signal_id)
 
         elif action == "close":
-            # Closing a position with a limit order
             user_state = info.user_state(ACCOUNT_ADDRESS)
             positions = user_state.get("assetPositions", [])
             position_size = 0.0
@@ -211,33 +191,28 @@ def execute_pending_signals(db_path: str, script_start_time: datetime):
                     break
 
             if position_size == 0:
-                logging.info(f"No position found to close for signal {signal_id}. Marking executed.")
+                logging.info(f"No position found to close for signal {signal_id}, marking executed.")
                 mark_signal_executed(db_path, signal_id)
                 continue
 
-            close_size = abs(position_size)
-            close_size = round(close_size, get_size_decimals())
+            close_size = round(abs(position_size), sz_decimals)
 
             all_mids = info.all_mids()
             btc_mid_str = all_mids.get("BTC")
             if not btc_mid_str:
-                logging.error("BTC mid price not found; cannot place limit order.")
+                logging.error("BTC mid price not found, marking failed.")
                 mark_signal_failed(db_path, signal_id)
                 continue
             btc_mid = float(btc_mid_str)
 
-            # Round limit price
             rounded_price = int(round(btc_mid))
-
             opposite_side = "short" if side == "long" else "long"
             resp = place_limit_order(opposite_side, close_size, rounded_price, reduce_only=True)
             if resp.get("status") == "err":
-                logging.error(f"Close order failed for signal {signal_id}. Marking as failed.")
                 mark_signal_failed(db_path, signal_id)
             else:
                 statuses = resp["response"]["data"].get("statuses", [])
                 if any("error" in s for s in statuses):
-                    logging.error(f"Exchange returned error for close signal {signal_id}. Marking as failed.")
                     mark_signal_failed(db_path, signal_id)
                 else:
                     mark_signal_executed(db_path, signal_id)
