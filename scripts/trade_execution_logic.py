@@ -24,10 +24,10 @@ api_wallet = Account.from_key(API_SECRET)
 if api_wallet.address.lower() != API_WALLET_ADDRESS.lower():
     raise ValueError("API wallet private key does not match the API wallet address")
 
-info = Info(constants.TESTNET_API_URL, skip_ws=True)
+info = Info(constants.MAINNET_API_URL, skip_ws=True)
 exchange = Exchange(
     wallet=api_wallet,
-    base_url=constants.TESTNET_API_URL,
+    base_url=constants.MAINNET_API_URL,
     account_address=ACCOUNT_ADDRESS
 )
 
