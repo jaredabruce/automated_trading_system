@@ -1,5 +1,6 @@
 # Automated Trading System
-This repository contains a Python-based automated trading system built around Hyperliquid’s API. It:
+This repository contains a Python-based automated trading system built around Hyperliquid’s API. 
+It:
 
 Acquires 1-minute candle data and aggregates them into hourly candles.
 Generates trade signals based on a simple IBS (Internal Bar Strength) strategy.
