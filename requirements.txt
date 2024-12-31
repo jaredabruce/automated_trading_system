@@ -1,9 +1,9 @@
 # Core Dependencies
-python-dotenv==1.0.1
-websockets==14.1
-requests==2.32.3
-eth-account==0.10.0
+python-dotenv
+websockets
+requests
+eth-account
 
 # Hyperliquid SDK
-hyperliquid-python-sdk==0.9.0
+hyperliquid-python-sdk
 
