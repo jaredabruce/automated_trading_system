@@ -34,7 +34,7 @@ automated_trading_system/
 1. Clone the Repository
 
 ```
-git clone https://github.com/yourusername/automated_trading_system.git
+git clone https://github.com/jaredabruce/automated_trading_system.git
 cd automated_trading_system
 ```
 
